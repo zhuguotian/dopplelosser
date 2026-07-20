@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>影子日记 Shadow Diary</title>
+<link rel="manifest" href="./manifest.json" />
+<link rel="icon" href="./icon-192.png" />
+<link rel="apple-touch-icon" href="./icon-192.png" />
+<meta name="theme-color" content="#0F6E56" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/3.4.1/tailwind.min.js"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" crossorigin></script>
+
+<style>
+  html, body { background:#f5f5f4; overscroll-behavior-y: contain; }
+  input, button { font-family: inherit; }
+  ::-webkit-scrollbar { display:none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- 捕获安装横幅，供"我的"页里的安装按钮使用 -->
+<script>
+  window.__deferredInstall = null;
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    window.__deferredInstall = e;
+    window.dispatchEvent(new Event("pwa-installable"));
+  });
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
+  }
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+// ———— 影子 peer：来自一位真实用户 361 天的减重轨迹（周序号 → 累计减重 %）————
+const PEER = [0.0,1.61,1.82,2.29,1.99,1.42,1.93,2.24,2.56,2.37,3.21,3.41,3.39,3.05,3.62,4.46,4.63,4.7,4.18,4.68,4.92,4.51,4.76,4.69,4.36,4.4,4.15,4.49,4.29,4.07,4.73,4.49,5.48,5.72,5.57,5.57,5.22,5.47,4.9,5.47,5.25,5.88,5.07,4.42,4.59,4.41,4.4,4.81,4.96,5.33,5.81,6.5];
+const PHASES = [
+  { from: 0, to: 1, name: "水分速降", color: "#9C93B8", tip: "开局 1–2 周体重掉得飞快（这位影子第 2 周就 −1.6%），其中大部分是水分和糖原，不是脂肪。别被它冲昏头，也别在它停下时灰心。" },
+  { from: 2, to: 22, name: "稳步下降", color: "#0F6E56", tip: "接下来约 5 个月是主力下降期，节奏在每周 −0.2% 左右。影子的经验：净摄入压在维持线下方 100–150 kcal 就够了，不需要饿。" },
+  { from: 23, to: 46, name: "平台期", color: "#B8860B", tip: "第 5–6 个月大概率撞上平台期，影子卡了整整 5 个月。原因不是吃多了——是体重下降后维持热量也下移了约 150 kcal。信号：零食悄悄 +100 kcal/天、大餐变频繁。对策：日均步数 +3,000，或把零食砍回去。" },
+  { from: 47, to: 51, name: "二次突破", color: "#C2410C", tip: "影子最终靠三件事同时发生才破局：步数拉到 9,000+、午饭减 100 kcal、大餐降频。单独任何一件都试过，没用；叠加就掉了。" },
+];
+const TAGS = [
+  { key: "早饭", color: "bg-amber-100 text-amber-900" },
+  { key: "午饭", color: "bg-sky-100 text-sky-900" },
+  { key: "晚饭", color: "bg-orange-100 text-orange-900" },
+  { key: "snack", color: "bg-emerald-100 text-emerald-900" },
+  { key: "运动", color: "bg-violet-100 text-violet-900" },
+];
+
+const STORE_KEY = "shadow-diary-v1";
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const addDays = (s, n) => { const d = new Date(s + "T12:00:00"); d.setDate(d.getDate() + n); return d.toISOString().slice(0, 10); };
+const fmtDate = (s) => { const d = new Date(s + "T12:00:00"); return `${d.getMonth() + 1}月${d.getDate()}日 周${"日一二三四五六"[d.getDay()]}`; };
+
+// 真实浏览器 localStorage 持久化（Android/Chrome 上重启App后数据仍在）
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    return raw ? JSON.parse(raw) : { profile: null, days: {} };
+  } catch (e) { return { profile: null, days: {} }; }
+}
+function useStore() {
+  const [state, setState] = useState(loadState);
+  const persist = (next) => {
+    setState(next);
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(next)); }
+    catch (e) { console.error("保存失败", e); }
+  };
+  return { state, persist };
+}
+
+function demoDays() {
+  const days = {};
+  let w = 85.5;
+  const foods = [["早饭","鸡蛋三明治",350],["午饭","鸡肉饭",850],["晚饭","牛肉面",950],["snack","咖啡牛奶",90],["snack","酸奶",160],["运动","散步 5km",-180]];
+  for (let i = 20; i >= 0; i--) {
+    const d = addDays(todayStr(), -i);
+    w += (Math.random() - 0.62) * 0.5;
+    const e = foods.filter(() => Math.random() > 0.2).map(([t, n, c], j) => ({ id: `${d}-${j}`, t, n, c: Math.round(c * (0.8 + Math.random() * 0.4)) }));
+    days[d] = { w: Math.round(w * 20) / 20, e };
+  }
+  return days;
+}
+
+const estTDEE = (p, curW) => {
+  const w = curW ?? p.weight0;
+  const bmr = 10 * w + 6.25 * p.height - 5 * p.age + (p.sex === "male" ? 5 : -161);
+  return Math.round(bmr * 1.4);
+};
+
+// ———— 导出：按日期范围整理出「明细」与「每日汇总」两张表 ————
+function buildExportRows(days, start, end) {
+  const dates = Object.keys(days).filter((d) => d >= start && d <= end).sort();
+  const entries = [], summary = [];
+  dates.forEach((d) => {
+    const dd = days[d];
+    const intake = dd.e.filter((x) => x.c > 0).reduce((s, x) => s + x.c, 0);
+    const burn = -dd.e.filter((x) => x.c < 0).reduce((s, x) => s + x.c, 0);
+    summary.push({ 日期: d, 体重kg: dd.w ?? "", 摄入kcal: intake, 运动消耗kcal: burn, 净摄入kcal: intake - burn });
+    if (dd.e.length === 0) {
+      entries.push({ 日期: d, 体重kg: dd.w ?? "", 标签: "", 项目: "", 热量kcal: "" });
+    } else {
+      dd.e.forEach((x) => entries.push({ 日期: d, 体重kg: dd.w ?? "", 标签: x.t, 项目: x.n, 热量kcal: x.c }));
+    }
+  });
+  return { entries, summary, dates };
+}
+
+function toCSV(rows) {
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  const esc = (v) => { const s = String(v ?? ""); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  return [headers.join(","), ...rows.map((r) => headers.map((h) => esc(r[h])).join(","))].join("\n");
+}
+
+function downloadBlob(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function ExportSection({ days }) {
+  const allDates = Object.keys(days).sort();
+  const minD = allDates[0] || todayStr();
+  const maxD = allDates[allDates.length - 1] || todayStr();
+  const [start, setStart] = useState(minD);
+  const [end, setEnd] = useState(maxD);
+
+  useEffect(() => { if (allDates.length) { setStart(allDates[0]); setEnd(allDates[allDates.length - 1]); } }, [allDates.length]); // eslint-disable-line
+
+  const { entries, summary, dates } = useMemo(() => buildExportRows(days, start, end), [days, start, end]);
+  const empty = dates.length === 0;
+
+  const preset = (n) => { setEnd(maxD); setStart(n === 0 ? minD : addDays(maxD, -(n - 1))); };
+
+  const exportCSV = () => {
+    if (empty) return;
+    downloadBlob(`饮食记录_${start}_to_${end}.csv`, "\uFEFF" + toCSV(entries), "text/csv;charset=utf-8");
+  };
+  const exportExcel = () => {
+    if (empty) return;
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summary), "每日汇总");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(entries), "明细记录");
+    XLSX.writeFile(wb, `饮食记录_${start}_to_${end}.xlsx`);
+  };
+
+  return (
+    <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
+      <div className="text-sm" style={{ fontWeight: 500 }}>导出数据</div>
+      <p className="text-xs text-stone-500 leading-relaxed">选一个日期范围，导出成 Excel 或 CSV，方便你用其他工具做进一步分析。</p>
+      <div className="flex gap-1.5">
+        {[["全部", 0], ["近 7 天", 7], ["近 30 天", 30], ["近 90 天", 90]].map(([label, n]) => (
+          <button key={label} onClick={() => preset(n)} className="px-2.5 py-1 rounded-full text-xs bg-stone-100 text-stone-500">{label}</button>
+        ))}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block">
+          <span className="text-xs text-stone-500">起始日期</span>
+          <input type="date" value={start} min={minD} max={end} onChange={(e) => setStart(e.target.value)} className="w-full border border-stone-200 rounded-lg px-2 py-1.5 text-xs mt-1 outline-none focus:border-emerald-700" />
+        </label>
+        <label className="block">
+          <span className="text-xs text-stone-500">结束日期</span>
+          <input type="date" value={end} min={start} max={maxD} onChange={(e) => setEnd(e.target.value)} className="w-full border border-stone-200 rounded-lg px-2 py-1.5 text-xs mt-1 outline-none focus:border-emerald-700" />
+        </label>
+      </div>
+      <div className="text-xs text-stone-400">{empty ? "所选范围内没有记录" : `${dates.length} 天记录 · ${entries.length} 条明细`}</div>
+      <div className="flex gap-2">
+        <button onClick={exportExcel} disabled={empty} className="flex-1 py-2 rounded-lg text-sm text-white disabled:opacity-30" style={{ background: "#0F6E56" }}>导出 Excel</button>
+        <button onClick={exportCSV} disabled={empty} className="flex-1 py-2 rounded-lg text-sm border border-stone-300 text-stone-600 disabled:opacity-30">导出 CSV</button>
+      </div>
+    </div>
+  );
+}
+
+
+// ———— 表单字段：定义在组件外部，重渲染时引用稳定，输入不丢焦点 ————
+function Field({ label, value, onChange, unit, type = "text", mode = "decimal" }) {
+  return (
+    <label className="block">
+      <span className="text-xs text-stone-500">{label}</span>
+      <div className="flex items-center gap-2 border border-stone-200 rounded-lg px-3 py-2 mt-1 bg-white focus-within:border-emerald-700">
+        <input type={type} inputMode={mode} value={value} onChange={onChange} className="flex-1 min-w-0 text-sm outline-none bg-transparent" />
+        {unit && <span className="text-xs text-stone-400 shrink-0">{unit}</span>}
+      </div>
+    </label>
+  );
+}
+
+// ———— Chart.js 图表组件（Canvas，避免额外打包依赖）————
+function useLineChart(ref, build, deps) {
+  const chart = useRef(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    if (chart.current) chart.current.destroy();
+    chart.current = new Chart(ref.current, build());
+    return () => chart.current && chart.current.destroy();
+    // eslint-disable-next-line
+  }, deps);
+}
+
+function WeightChart({ trend, target }) {
+  const ref = useRef(null);
+  const data = trend.slice(-30);
+  useLineChart(ref, () => ({
+    type: "line",
+    data: {
+      labels: data.map((r) => r.label),
+      datasets: [
+        { label: "体重", data: data.map((r) => r.w), borderColor: "transparent", backgroundColor: "#a8a29e", pointRadius: 2, showLine: false, spanGaps: false },
+        { label: "7日均", data: data.map((r) => r.ma), borderColor: "#0F6E56", borderWidth: 2, pointRadius: 0, spanGaps: true, tension: 0.25 },
+        ...(target ? [{ label: "目标", data: data.map(() => target), borderColor: "#C2410C", borderDash: [4, 3], borderWidth: 1.5, pointRadius: 0 }] : []),
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => c.dataset.label + ": " + (c.parsed.y == null ? "—" : c.parsed.y.toFixed(2) + " kg") } } },
+      scales: {
+        y: { ticks: { color: "#a8a29e", font: { size: 10 } }, grid: { color: "rgba(168,162,158,0.15)" } },
+        x: { ticks: { color: "#a8a29e", font: { size: 10 }, maxTicksLimit: 7 }, grid: { display: false } },
+      },
+    },
+  }), [JSON.stringify(data), target]);
+  return <canvas ref={ref} />;
+}
+
+function NetChart({ trend, suggest }) {
+  const ref = useRef(null);
+  const data = trend.slice(-14);
+  useLineChart(ref, () => ({
+    type: "bar",
+    data: { labels: data.map((r) => r.label), datasets: [{ label: "净摄入", data: data.map((r) => r.net), backgroundColor: "#5DCAA5", borderRadius: 3, maxBarThickness: 24 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => c.parsed.y + " kcal" } } },
+      scales: { y: { ticks: { color: "#a8a29e", font: { size: 10 } }, grid: { color: "rgba(168,162,158,0.15)" } }, x: { ticks: { color: "#a8a29e", font: { size: 10 } }, grid: { display: false } } },
+    },
+    plugins: [{
+      id: "suggestLine",
+      afterDraw(c) {
+        const y = c.scales.y.getPixelForValue(suggest);
+        const { left, right } = c.chartArea;
+        const ctx = c.ctx;
+        ctx.save();
+        ctx.strokeStyle = "#C2410C"; ctx.setLineDash([4, 3]); ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+        ctx.restore();
+      },
+    }],
+  }), [JSON.stringify(data), suggest]);
+  return <canvas ref={ref} />;
+}
+
+function ShadowChart({ data }) {
+  const ref = useRef(null);
+  useLineChart(ref, () => ({
+    type: "line",
+    data: {
+      labels: data.map((r) => r.week),
+      datasets: [
+        { label: "影子", data: data.map((r) => r.peer ?? null), borderColor: "#9C93B8", borderDash: [5, 4], borderWidth: 1.5, pointRadius: 0, backgroundColor: "rgba(156,147,184,0.12)", fill: true, spanGaps: true },
+        { label: "你", data: data.map((r) => r.you ?? null), borderColor: "#0F6E56", borderWidth: 2.5, pointRadius: 2.5, spanGaps: true },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => c.dataset.label + ": " + c.parsed.y + " %" } } },
+      scales: {
+        y: { reverse: true, ticks: { color: "#a8a29e", font: { size: 10 }, callback: (v) => v + "%" }, grid: { color: "rgba(168,162,158,0.15)" } },
+        x: { title: { display: true, text: "第 N 周", color: "#a8a29e", font: { size: 10 } }, ticks: { color: "#a8a29e", font: { size: 10 }, maxTicksLimit: 8 }, grid: { display: false } },
+      },
+    },
+  }), [JSON.stringify(data)]);
+  return <canvas ref={ref} />;
+}
+
+// ———— 建账户 / 编辑资料 ————
+function Onboarding({ initial, onDone }) {
+  const [f, setF] = useState(initial || { name: "", sex: "male", age: "", height: "", weight0: "", target: "", targetDate: addDays(todayStr(), 180) });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const num = (v) => parseFloat(v);
+  const valid = f.name.trim() && num(f.age) > 0 && num(f.height) > 0 && num(f.weight0) > 0 && num(f.target) > 0 && f.targetDate > todayStr();
+
+  let plan = null;
+  if (valid) {
+    const weeks = Math.max(1, (new Date(f.targetDate) - new Date(todayStr())) / (7 * 864e5));
+    const rate = (num(f.weight0) - num(f.target)) / weeks;
+    const p = { ...f, age: num(f.age), height: num(f.height), weight0: num(f.weight0), target: num(f.target) };
+    const tdee = estTDEE(p, p.weight0);
+    const safeMax = Math.round(p.weight0 * 0.01 * 100) / 100;
+    plan = { weeks: Math.round(weeks), rate: Math.round(rate * 100) / 100, tdee, suggest: Math.round(tdee - (rate * 7700) / 7), tooFast: rate > safeMax, gain: rate < 0, safeMax };
+  }
+
+  return (
+    <div className="px-5 pt-6 pb-10 space-y-5">
+      <div>
+        <h2 className="text-xl" style={{ fontWeight: 500 }}>{initial ? "编辑我的资料" : "创建你的账户"}</h2>
+        <p className="text-xs text-stone-400 mt-1">这些信息只保存在你的设备上，用来计算维持热量和目标节奏。</p>
+      </div>
+      <Field label="昵称" value={f.name} onChange={set("name")} mode="text" />
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block">
+          <span className="text-xs text-stone-500">性别（用于代谢估算）</span>
+          <div className="flex gap-2 mt-1">
+            {[["male", "男"], ["female", "女"]].map(([v, t]) => (
+              <button key={v} onClick={() => setF({ ...f, sex: v })} className={`flex-1 py-2 rounded-lg text-sm border ${f.sex === v ? "border-emerald-700 bg-emerald-50 text-emerald-900" : "border-stone-200 bg-white text-stone-500"}`}>{t}</button>
+            ))}
+          </div>
+        </label>
+        <Field label="年龄" value={f.age} onChange={set("age")} unit="岁" mode="numeric" />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="身高" value={f.height} onChange={set("height")} unit="cm" />
+        <Field label="当前体重" value={f.weight0} onChange={set("weight0")} unit="kg" />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="目标体重" value={f.target} onChange={set("target")} unit="kg" />
+        <label className="block">
+          <span className="text-xs text-stone-500">目标日期</span>
+          <div className="border border-stone-200 rounded-lg px-3 py-2 mt-1 bg-white focus-within:border-emerald-700">
+            <input type="date" min={addDays(todayStr(), 7)} value={f.targetDate} onChange={set("targetDate")} className="w-full text-sm outline-none bg-transparent" />
+          </div>
+        </label>
+      </div>
+
+      {plan && !plan.gain && (
+        <div className={`rounded-xl px-4 py-3 text-xs leading-relaxed ${plan.tooFast ? "bg-orange-50 text-orange-900" : "bg-emerald-50 text-emerald-900"}`}>
+          共 {plan.weeks} 周，需要每周约 −{plan.rate} kg。估算维持热量 ≈ {plan.tdee.toLocaleString()} kcal/天，对应净摄入目标 ≈ <b>{plan.suggest.toLocaleString()} kcal/天</b>。
+          {plan.tooFast && <span> 这个节奏超过了每周 1%（约 {plan.safeMax} kg）的安全上限，容易掉肌肉、也容易反弹——影子的建议：把日期放宽一点，慢就是快。</span>}
+        </div>
+      )}
+      {plan && plan.gain && (
+        <div className="rounded-xl px-4 py-3 text-xs bg-sky-50 text-sky-900">目标体重高于当前体重，将按增重/维持模式记录（净摄入目标 ≈ {plan.tdee.toLocaleString()} kcal/天以上）。</div>
+      )}
+
+      <button disabled={!valid}
+        onClick={() => onDone({ ...f, age: num(f.age), height: num(f.height), weight0: num(f.weight0), target: num(f.target), createdAt: initial?.createdAt || todayStr() })}
+        className="w-full py-3 rounded-xl text-white text-sm disabled:opacity-30" style={{ background: "#0F6E56" }}>
+        {initial ? "保存修改" : "开始记录"}
+      </button>
+    </div>
+  );
+}
+
+function App() {
+  const { state, persist } = useStore();
+  const { profile, days } = state;
+  const [tab, setTab] = useState("today");
+  const [editing, setEditing] = useState(false);
+  const [date, setDate] = useState(todayStr());
+  const [tag, setTag] = useState("午饭");
+  const [name, setName] = useState("");
+  const [kcal, setKcal] = useState("");
+  const [wInput, setWInput] = useState("");
+  const [installable, setInstallable] = useState(false);
+
+  useEffect(() => {
+    const on = () => setInstallable(true);
+    window.addEventListener("pwa-installable", on);
+    return () => window.removeEventListener("pwa-installable", on);
+  }, []);
+
+  const day = days[date] || { w: null, e: [] };
+  useEffect(() => { setWInput(day.w != null ? String(day.w) : ""); }, [date]); // eslint-disable-line
+
+  const intake = day.e.filter((x) => x.c > 0).reduce((s, x) => s + x.c, 0);
+  const burn = -day.e.filter((x) => x.c < 0).reduce((s, x) => s + x.c, 0);
+  const net = intake - burn;
+
+  const saveDays = (nd) => persist({ ...state, days: nd });
+  const addEntry = () => {
+    const v = parseInt(kcal, 10);
+    if (!name.trim() || isNaN(v)) return;
+    const c = tag === "运动" ? -Math.abs(v) : Math.abs(v);
+    saveDays({ ...days, [date]: { ...day, e: [...day.e, { id: Date.now() + "", t: tag, n: name.trim(), c }] } });
+    setName(""); setKcal("");
+  };
+  const delEntry = (id) => saveDays({ ...days, [date]: { ...day, e: day.e.filter((x) => x.id !== id) } });
+  const saveWeight = () => {
+    const v = parseFloat(wInput);
+    saveDays({ ...days, [date]: { ...day, w: isNaN(v) ? null : v } });
+  };
+
+  const sorted = useMemo(() => Object.keys(days).sort(), [days]);
+  const trend = useMemo(() => {
+    const rows = sorted.map((d) => {
+      const dd = days[d];
+      const inn = dd.e.filter((x) => x.c > 0).reduce((s, x) => s + x.c, 0);
+      const bb = -dd.e.filter((x) => x.c < 0).reduce((s, x) => s + x.c, 0);
+      return { d, label: d.slice(5), w: dd.w, net: inn - bb };
+    });
+    rows.forEach((r, i) => {
+      const win = rows.slice(Math.max(0, i - 6), i + 1).map((x) => x.w).filter((x) => x != null);
+      r.ma = win.length >= 3 ? Math.round((win.reduce((a, b) => a + b, 0) / win.length) * 100) / 100 : null;
+    });
+    return rows;
+  }, [sorted, days]);
+
+  const latestW = useMemo(() => [...trend].reverse().find((r) => r.w != null)?.w ?? profile?.weight0, [trend, profile]);
+  const tdee = profile ? estTDEE(profile, latestW) : 2100;
+  const goalRate = profile ? (latestW - profile.target) / Math.max(1, (new Date(profile.targetDate) - new Date(todayStr())) / (7 * 864e5)) : 0;
+  const suggest = profile ? Math.round(tdee - Math.max(0, goalRate) * 7700 / 7) : 2100;
+
+  const journey = useMemo(() => {
+    const wRows = trend.filter((r) => r.w != null);
+    if (!wRows.length) return { user: [], week: 0 };
+    const start = new Date(wRows[0].d + "T12:00:00");
+    const w0 = profile?.weight0 ?? wRows[0].w;
+    const byWeek = {};
+    wRows.forEach((r) => {
+      const wk = Math.floor((new Date(r.d + "T12:00:00") - start) / (7 * 864e5));
+      (byWeek[wk] = byWeek[wk] || []).push(r.w);
+    });
+    const user = Object.keys(byWeek).map((k) => ({ week: +k, you: Math.round(((w0 - byWeek[k].reduce((a, b) => a + b, 0) / byWeek[k].length) / w0) * 10000) / 100 }));
+    return { user, week: Math.max(...user.map((u) => u.week)) };
+  }, [trend, profile]);
+
+  const shadowData = useMemo(() => {
+    const map = {};
+    PEER.forEach((p, i) => (map[i] = { week: i, peer: p }));
+    journey.user.forEach((u) => (map[u.week] = { ...(map[u.week] || { week: u.week }), you: u.you }));
+    return Object.values(map).sort((a, b) => a.week - b.week);
+  }, [journey]);
+
+  const curPhase = PHASES.find((p) => journey.week >= p.from && journey.week <= p.to) || PHASES[PHASES.length - 1];
+  const bmi = profile ? Math.round((latestW / ((profile.height / 100) ** 2)) * 10) / 10 : null;
+  const progress = profile ? Math.min(100, Math.max(0, Math.round(((profile.weight0 - latestW) / (profile.weight0 - profile.target)) * 100))) : 0;
+
+  return (
+    <div className="min-h-screen bg-stone-100 flex justify-center font-sans text-stone-900">
+      <div className="w-full max-w-md bg-stone-50 min-h-screen flex flex-col shadow-sm">
+        <header className="px-5 pt-6 pb-4 border-b border-stone-200" style={{ paddingTop: "calc(1.5rem + env(safe-area-inset-top))" }}>
+          <div className="flex items-baseline justify-between">
+            <h1 className="text-lg tracking-wide" style={{ fontWeight: 500 }}>影子日记</h1>
+            <span className="text-xs text-stone-400">{profile ? `${profile.name} · 目标 ${profile.target} kg` : "每一步，都有人走过"}</span>
+          </div>
+        </header>
+
+        <main className="flex-1 overflow-y-auto pb-24">
+          {(!profile || editing) ? (
+            <Onboarding initial={editing ? profile : null} onDone={(p) => { persist({ ...state, profile: p }); setEditing(false); setTab("today"); }} />
+          ) : (
+            <>
+              {tab === "today" && (
+                <div className="px-5 pt-4 space-y-5">
+                  <div className="flex items-center justify-between">
+                    <button onClick={() => setDate(addDays(date, -1))} className="w-9 h-9 rounded-full border border-stone-300 text-stone-500">‹</button>
+                    <div className="text-sm text-stone-600">{fmtDate(date)}{date === todayStr() && <span className="ml-1 text-emerald-700">· 今天</span>}</div>
+                    <button onClick={() => setDate(addDays(date, 1))} disabled={date >= todayStr()} className="w-9 h-9 rounded-full border border-stone-300 text-stone-500 disabled:opacity-30">›</button>
+                  </div>
+                  <div className="text-center py-2">
+                    <div className="text-5xl tabular-nums" style={{ fontWeight: 500, color: net > suggest ? "#C2410C" : "#0F6E56" }}>{net.toLocaleString()}</div>
+                    <div className="text-xs text-stone-500 mt-1">今日净摄入 kcal　·　摄入 {intake.toLocaleString()} − 运动 {burn.toLocaleString()}</div>
+                    <div className="text-xs mt-1 text-stone-400">你的目标线 ≈ {suggest.toLocaleString()} kcal（按当前体重与目标节奏估算）</div>
+                  </div>
+                  <div className="flex items-center gap-2 bg-white rounded-xl border border-stone-200 px-4 py-3">
+                    <span className="text-sm text-stone-600 shrink-0">当日体重</span>
+                    <input value={wInput} onChange={(e) => setWInput(e.target.value)} onBlur={saveWeight} inputMode="decimal" placeholder="—" className="flex-1 text-right text-lg tabular-nums bg-transparent outline-none" />
+                    <span className="text-sm text-stone-400">kg</span>
+                  </div>
+                  <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
+                    <div className="flex gap-1.5 flex-wrap">
+                      {TAGS.map((t) => (
+                        <button key={t.key} onClick={() => setTag(t.key)} className={`px-2.5 py-1.5 rounded-full text-xs transition ${tag === t.key ? t.color + " ring-1 ring-current" : "bg-stone-100 text-stone-500"}`}>【{t.key}】</button>
+                      ))}
+                    </div>
+                    <div className="flex gap-2">
+                      <input value={name} onChange={(e) => setName(e.target.value)} placeholder={tag === "运动" ? "举铁 / 散步 5km…" : "早餐三明治 / chipotle bowl…"} className="flex-1 min-w-0 border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-emerald-700" />
+                      <input value={kcal} onChange={(e) => setKcal(e.target.value)} inputMode="numeric" placeholder="kcal" className="w-20 border border-stone-200 rounded-lg px-3 py-2 text-sm text-right tabular-nums outline-none focus:border-emerald-700" />
+                      <button onClick={addEntry} className="px-4 rounded-lg text-sm text-white" style={{ background: "#0F6E56" }}>记</button>
+                    </div>
+                  </div>
+                  <div className="space-y-1.5">
+                    {day.e.length === 0 && (
+                      <div className="text-center text-sm text-stone-400 py-8">
+                        今天还没有记录。
+                        {sorted.length === 0 && <button onClick={() => saveDays(demoDays())} className="block mx-auto mt-3 text-xs px-3 py-1.5 rounded-full border border-stone-300 text-stone-500">载入 3 周示例数据看看效果</button>}
+                      </div>
+                    )}
+                    {day.e.map((x) => {
+                      const tc = TAGS.find((t) => t.key === x.t)?.color || "bg-stone-100 text-stone-600";
+                      return (
+                        <div key={x.id} className="flex items-center gap-2 bg-white rounded-lg border border-stone-200 px-3 py-2">
+                          <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${tc}`}>{x.t}</span>
+                          <span className="flex-1 text-sm truncate">{x.n}</span>
+                          <span className={`text-sm tabular-nums ${x.c < 0 ? "text-violet-700" : "text-stone-700"}`}>{x.c}</span>
+                          <button onClick={() => delEntry(x.id)} className="text-stone-300 hover:text-red-500 text-sm px-1">✕</button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {tab === "trend" && (
+                <div className="px-5 pt-5 space-y-6">
+                  <section>
+                    <h2 className="text-sm text-stone-600 mb-2">体重与 7 日均线</h2>
+                    {trend.filter((r) => r.w != null).length < 2 ? (
+                      <div className="text-sm text-stone-400 py-10 text-center">至少记录两天体重后，这里会画出你的曲线。</div>
+                    ) : (
+                      <div className="h-52 bg-white rounded-xl border border-stone-200 p-2"><WeightChart trend={trend} target={profile?.target} /></div>
+                    )}
+                  </section>
+                  <section>
+                    <h2 className="text-sm text-stone-600 mb-2">每日净摄入（近 14 天）</h2>
+                    <div className="h-44 bg-white rounded-xl border border-stone-200 p-2"><NetChart trend={trend} suggest={suggest} /></div>
+                  </section>
+                </div>
+              )}
+
+              {tab === "shadow" && (
+                <div className="px-5 pt-5 space-y-5">
+                  <section>
+                    <h2 className="text-sm text-stone-600 mb-1">你 vs 影子 · 累计减重 %</h2>
+                    <p className="text-xs text-stone-400 mb-2">影子是一位真实用户 52 周的匿名轨迹（一年 −6.5%）。按各自起始体重归一化，体重不同也能同框。</p>
+                    <div className="h-56 bg-white rounded-xl border border-stone-200 p-2"><ShadowChart data={shadowData} /></div>
+                  </section>
+                  {journey.user.length > 0 && (
+                    <div className="rounded-xl px-4 py-3 text-sm" style={{ background: "#E1F5EE", color: "#04342C" }}>
+                      你在第 {journey.week} 周，累计 −{(journey.user.at(-1)?.you ?? 0).toFixed(1)}%；影子同期是 −{(PEER[Math.min(journey.week, 51)] ?? 0).toFixed(1)}%。
+                    </div>
+                  )}
+                  <section className="space-y-2.5">
+                    <h2 className="text-sm text-stone-600">前方路况 · 影子走过的四段路</h2>
+                    {PHASES.map((p) => (
+                      <div key={p.name} className={`bg-white rounded-xl border px-4 py-3 ${p === curPhase && journey.user.length ? "border-emerald-700" : "border-stone-200"}`}>
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="w-2 h-2 rounded-full" style={{ background: p.color }} />
+                          <span className="text-sm" style={{ fontWeight: 500 }}>{p.name}</span>
+                          <span className="text-xs text-stone-400">第 {p.from}–{p.to} 周</span>
+                          {p === curPhase && journey.user.length > 0 && <span className="ml-auto text-xs text-emerald-700">你在这里</span>}
+                        </div>
+                        <p className="text-xs text-stone-500 leading-relaxed">{p.tip}</p>
+                      </div>
+                    ))}
+                  </section>
+                  <p className="text-xs text-stone-400 leading-relaxed pb-2">未来版本：你的数据经明确同意后，会以脱敏后的周度轨迹（不含任何食物文本）加入影子库，成为别人路上的那盏灯。</p>
+                </div>
+              )}
+
+              {tab === "me" && (
+                <div className="px-5 pt-5 space-y-4">
+                  <div className="bg-white rounded-xl border border-stone-200 p-4">
+                    <div className="flex items-center gap-3 mb-3">
+                      <div className="w-11 h-11 rounded-full flex items-center justify-center text-white text-sm" style={{ background: "#0F6E56", fontWeight: 500 }}>{profile.name.slice(0, 2)}</div>
+                      <div>
+                        <div className="text-sm" style={{ fontWeight: 500 }}>{profile.name}</div>
+                        <div className="text-xs text-stone-400">{profile.age} 岁 · {profile.height} cm · BMI {bmi}</div>
+                      </div>
+                      <button onClick={() => setEditing(true)} className="ml-auto text-xs text-emerald-800 border border-emerald-200 rounded-full px-3 py-1">编辑</button>
+                    </div>
+                    <div className="text-xs text-stone-500 mb-1.5">目标进度　{profile.weight0} kg → {profile.target} kg（{profile.targetDate} 前）</div>
+                    <div className="h-2 rounded-full bg-stone-100 overflow-hidden"><div className="h-full rounded-full" style={{ width: progress + "%", background: "#0F6E56" }} /></div>
+                    <div className="flex justify-between text-xs text-stone-400 mt-1.5"><span>当前 {latestW ?? "—"} kg</span><span>已完成 {progress}%</span></div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-white rounded-xl border border-stone-200 p-3.5">
+                      <div className="text-xs text-stone-400">估算维持热量</div>
+                      <div className="text-xl tabular-nums mt-0.5" style={{ fontWeight: 500 }}>{tdee.toLocaleString()}</div>
+                      <div className="text-xs text-stone-400">kcal/天 · 随体重更新</div>
+                    </div>
+                    <div className="bg-white rounded-xl border border-stone-200 p-3.5">
+                      <div className="text-xs text-stone-400">净摄入目标线</div>
+                      <div className="text-xl tabular-nums mt-0.5" style={{ fontWeight: 500, color: "#0F6E56" }}>{suggest.toLocaleString()}</div>
+                      <div className="text-xs text-stone-400">kcal/天 · 按目标节奏</div>
+                    </div>
+                  </div>
+                  {installable && (
+                    <button onClick={async () => { if (window.__deferredInstall) { window.__deferredInstall.prompt(); await window.__deferredInstall.userChoice; window.__deferredInstall = null; setInstallable(false); } }}
+                      className="w-full py-3 rounded-xl text-white text-sm" style={{ background: "#0F6E56" }}>
+                      安装到主屏幕
+                    </button>
+                  )}
+                  <ExportSection days={days} />
+                  <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-2">
+                    <div className="text-sm" style={{ fontWeight: 500 }}>数据与隐私</div>
+                    <p className="text-xs text-stone-500 leading-relaxed">所有记录仅保存在本设备浏览器中。未来的「加入影子库」为可选项，且只上传脱敏后的周度轨迹。</p>
+                    {sorted.length > 0 && <button onClick={() => persist({ profile, days: {} })} className="text-xs text-red-400">清空全部饮食与体重记录</button>}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </main>
+
+        {profile && !editing && (
+          <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-md bg-white border-t border-stone-200 flex" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
+            {[["today", "今日"], ["trend", "趋势"], ["shadow", "影子"], ["me", "我的"]].map(([k, label]) => (
+              <button key={k} onClick={() => setTab(k)} className={`flex-1 py-3.5 text-sm ${tab === k ? "text-emerald-800" : "text-stone-400"}`} style={tab === k ? { fontWeight: 500 } : {}}>{label}</button>
+            ))}
+          </nav>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
