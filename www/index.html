@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/3.4.1/tailwind.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
@@ -40,7 +40,7 @@
   }
 </script>
 
-<script type="text/babel" data-presets="react">
+<script type="text/plain" id="app-source">
 const { useState, useEffect, useMemo, useRef } = React;
 
 // ———— 影子 peer：来自一位真实用户 361 天的减重轨迹（周序号 → 累计减重 %）————
@@ -612,6 +612,19 @@ function App() {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<script>
+  // 手动编译上面那段 JSX 源码，明确指定 "classic" 运行时（生成 React.createElement 调用），
+  // 而不是 Babel 较新版本默认的 "automatic" 运行时（会插入 import "react/jsx-runtime"，
+  // 在没有打包工具的纯 <script> 环境下无法解析，导致整页脚本崩溃、白屏且控制台报语法错误）。
+  (function () {
+    var source = document.getElementById("app-source").textContent;
+    var output = Babel.transform(source, {
+      presets: [["react", { runtime: "classic" }]],
+    }).code;
+    (0, eval)(output);
+  })();
 </script>
 </body>
 </html>
